@@ -2,10 +2,12 @@ import path from "node:path";
 import { type Api, getEnvApiKey, type Model } from "@mariozechner/pi-ai";
 import { formatCliCommand } from "../cli/command-format.js";
 import type { OpenClawConfig } from "../config/config.js";
+import { loadConfig } from "../config/config.js";
 import type { ModelProviderAuthMode, ModelProviderConfig } from "../config/types.js";
 import { coerceSecretRef } from "../config/types.secrets.js";
 import { getShellEnvAppliedKeys } from "../infra/shell-env.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
+import { BrokerClient } from "../seks/broker-client.js";
 import {
   normalizeOptionalSecretInput,
   normalizeSecretInput,
@@ -28,6 +30,30 @@ import {
 import { normalizeProviderId } from "./model-selection.js";
 
 export { ensureAuthProfileStore, resolveAuthProfileOrder } from "./auth-profiles.js";
+
+/**
+ * Resolve broker base URL for provider if broker is configured
+ */
+export function resolveBrokerBaseUrl(provider: string): string | undefined {
+  const cfg = loadConfig();
+  const brokerUrl = cfg?.seks?.broker?.url;
+  if (!brokerUrl) {
+    return undefined;
+  }
+  const cleanBrokerUrl = brokerUrl.replace(/\/$/, "");
+  return `${cleanBrokerUrl}/v1/proxy/${provider}`;
+}
+
+/**
+ * Check if broker is configured and create client if needed
+ */
+function createBrokerClientIfConfigured(cfg?: OpenClawConfig): BrokerClient | undefined {
+  const brokerConfig = cfg?.seks?.broker;
+  if (!brokerConfig?.url) {
+    return undefined;
+  }
+  return new BrokerClient(brokerConfig.url, brokerConfig.token, brokerConfig.tokenCommand);
+}
 
 const log = createSubsystemLogger("model-auth");
 
@@ -276,7 +302,7 @@ export type ResolvedProviderAuth = {
   apiKey?: string;
   profileId?: string;
   source: string;
-  mode: "api-key" | "oauth" | "token" | "aws-sdk";
+  mode: "api-key" | "oauth" | "token" | "aws-sdk" | "broker";
 };
 
 export async function resolveApiKeyForProvider(params: {
@@ -289,6 +315,27 @@ export async function resolveApiKeyForProvider(params: {
 }): Promise<ResolvedProviderAuth> {
   const { provider, cfg, profileId, preferredProfile } = params;
   const store = params.store ?? ensureAuthProfileStore(params.agentDir);
+
+  // Check if SEKS broker is configured
+  const brokerClient = createBrokerClientIfConfigured(cfg);
+  if (brokerClient) {
+    try {
+      const brokerToken = await brokerClient.resolveToken();
+      return {
+        apiKey: brokerToken,
+        source: "seks-broker",
+        mode: "broker",
+      };
+    } catch (error: unknown) {
+      if (error instanceof Error) {
+        throw new Error(`Failed to execute tokenCommand: ${error.message}`, { cause: error });
+      } else {
+        throw new Error(`Failed to execute tokenCommand: An unknown error occurred`, {
+          cause: error,
+        });
+      }
+    }
+  }
 
   if (profileId) {
     const resolved = await resolveApiKeyForProfile({
@@ -394,7 +441,14 @@ export async function resolveApiKeyForProvider(params: {
 }
 
 export type EnvApiKeyResult = { apiKey: string; source: string };
-export type ModelAuthMode = "api-key" | "oauth" | "token" | "mixed" | "aws-sdk" | "unknown";
+export type ModelAuthMode =
+  | "api-key"
+  | "oauth"
+  | "token"
+  | "mixed"
+  | "aws-sdk"
+  | "broker"
+  | "unknown";
 
 export function resolveEnvApiKey(
   provider: string,
@@ -439,6 +493,11 @@ export function resolveModelAuthMode(
   const resolved = provider?.trim();
   if (!resolved) {
     return undefined;
+  }
+
+  const brokerClient = createBrokerClientIfConfigured(cfg);
+  if (brokerClient) {
+    return "broker";
   }
 
   const authOverride = resolveProviderAuthOverride(cfg, resolved);
