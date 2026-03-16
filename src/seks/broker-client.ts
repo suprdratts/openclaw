@@ -48,8 +48,14 @@ export class BrokerClient {
         });
         this.cachedToken = stdout.trim();
         return this.cachedToken;
-      } catch (error) {
-        throw new Error(`Failed to execute tokenCommand: ${error}`);
+      } catch (error: unknown) {
+        if (error instanceof Error) {
+          throw new Error(`Failed to execute tokenCommand: ${error.message}`, { cause: error });
+        } else {
+          throw new Error(`Failed to execute tokenCommand: An unknown error occurred`, {
+            cause: error,
+          });
+        }
       }
     }
 
@@ -59,21 +65,22 @@ export class BrokerClient {
   /**
    * Make authenticated HTTP request to broker
    */
-  private async request<T>(
-    path: string,
-    options: RequestInit = {}
-  ): Promise<T> {
+  private async request<T>(path: string, options: RequestInit = {}): Promise<T> {
     const token = await this.resolveToken();
     const url = `${this.brokerUrl}${path}`;
 
+    const headers: HeadersInit = {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    };
+
+    if (options.headers && typeof options.headers === "object" && !Array.isArray(options.headers)) {
+      Object.assign(headers, options.headers);
+    }
+
     const response = await fetch(url, {
       ...options,
-      headers: {
-        ...options.headers,
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-        ...options.headers,
-      },
+      headers,
     });
 
     if (!response.ok) {
@@ -105,7 +112,7 @@ export class BrokerClient {
   async proxyRequest(
     provider: string,
     path: string,
-    options: BrokerProxyRequestOptions = {}
+    options: BrokerProxyRequestOptions = {},
   ): Promise<Response> {
     const token = await this.resolveToken();
     const url = this.proxyUrl(provider, path);
