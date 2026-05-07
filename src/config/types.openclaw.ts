@@ -142,6 +142,13 @@ export type OpenClawConfig = {
   mcp?: McpConfig;
   /** Network-level SSRF protection via an operator-managed forward proxy. */
   proxy?: ProxyConfig;
+  seks?: {
+    broker?: {
+      url?: string;
+      token?: string;
+      tokenCommand?: string;
+    };
+  };
 };
 
 declare const openClawConfigStateBrand: unique symbol;
