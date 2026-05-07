@@ -1,4 +1,5 @@
-import type { ReplyPayload } from "../../../src/auto-reply/types.js";
+import { resolveSendableOutboundReplyParts } from "openclaw/plugin-sdk/reply-payload";
+import type { ReplyPayload } from "openclaw/plugin-sdk/reply-runtime";
 import type { TelegramInlineButtons } from "./button-types.js";
 import type { TelegramDraftStream } from "./draft-stream.js";
 import {
@@ -11,6 +12,7 @@ const MESSAGE_NOT_MODIFIED_RE =
   /400:\s*Bad Request:\s*message is not modified|MESSAGE_NOT_MODIFIED/i;
 const MESSAGE_NOT_FOUND_RE =
   /400:\s*Bad Request:\s*message to edit not found|MESSAGE_ID_INVALID|message can't be edited/i;
+const LONG_LIVED_PREVIEW_FRESH_FINAL_AFTER_MS = 60_000;
 
 function extractErrorText(err: unknown): string {
   return typeof err === "string"
@@ -37,6 +39,12 @@ function isMissingPreviewMessageError(err: unknown): boolean {
   return MESSAGE_NOT_FOUND_RE.test(extractErrorText(err));
 }
 
+function isIncompleteFinalPreviewPrefix(previewText: string, finalText: string): boolean {
+  const preview = previewText.trimEnd();
+  const final = finalText.trimEnd();
+  return preview.length > 0 && preview.length < final.length && final.startsWith(preview);
+}
+
 export type LaneName = "answer" | "reasoning";
 
 export type DraftLaneState = {
@@ -48,6 +56,7 @@ export type DraftLaneState = {
 export type ArchivedPreview = {
   messageId: number;
   textSnapshot: string;
+  visibleSinceMs?: number;
   // Boundary-finalized previews should remain visible even if no matching
   // final edit arrives; superseded previews can be safely deleted.
   deleteIfUnused?: boolean;
@@ -56,11 +65,14 @@ export type ArchivedPreview = {
 export type LanePreviewLifecycle = "transient" | "complete";
 
 export type LaneDeliveryResult =
-  | "preview-finalized"
-  | "preview-retained"
-  | "preview-updated"
-  | "sent"
-  | "skipped";
+  | {
+      kind: "preview-finalized";
+      delivery: {
+        content: string;
+        messageId?: number;
+      };
+    }
+  | { kind: "preview-retained" | "preview-updated" | "sent" | "skipped" };
 
 type CreateLaneTextDelivererParams = {
   lanes: Record<LaneName, DraftLaneState>;
@@ -69,6 +81,8 @@ type CreateLaneTextDelivererParams = {
   retainPreviewOnCleanupByLane: Record<LaneName, boolean>;
   draftMaxChars: number;
   applyTextToPayload: (payload: ReplyPayload, text: string) => ReplyPayload;
+  applyTextToFollowUpPayload?: (payload: ReplyPayload, text: string) => ReplyPayload;
+  splitFinalTextForPreview?: (text: string) => readonly string[];
   sendPayload: (payload: ReplyPayload) => Promise<boolean>;
   flushDraftLane: (lane: DraftLaneState) => Promise<void>;
   stopDraftLane: (lane: DraftLaneState) => Promise<void>;
@@ -82,6 +96,11 @@ type CreateLaneTextDelivererParams = {
   deletePreviewMessage: (messageId: number) => Promise<void>;
   log: (message: string) => void;
   markDelivered: () => void;
+  now?: () => number;
+  // Force fresh final when a visible non-preview message has been delivered
+  // since the active preview was created, even if the preview is younger
+  // than the long-lived threshold (#76529).
+  getLastVisibleNonPreviewDeliveryAtMs?: () => number | undefined;
 };
 
 type DeliverLaneTextParams = {
@@ -100,13 +119,13 @@ type TryUpdatePreviewParams = {
   previewButtons?: TelegramInlineButtons;
   stopBeforeEdit?: boolean;
   updateLaneSnapshot?: boolean;
-  skipRegressive: "always" | "existingOnly";
+  skipRegressive: RegressiveSkipMode;
   context: "final" | "update";
   previewMessageId?: number;
   previewTextSnapshot?: string;
 };
 
-type PreviewEditResult = "edited" | "retained" | "fallback";
+type PreviewEditResult = "edited" | "retained" | "regressive-skipped" | "fallback";
 
 type ConsumeArchivedAnswerPreviewParams = {
   lane: DraftLaneState;
@@ -117,7 +136,7 @@ type ConsumeArchivedAnswerPreviewParams = {
 };
 
 type PreviewUpdateContext = "final" | "update";
-type RegressiveSkipMode = "always" | "existingOnly";
+type RegressiveSkipMode = "always" | "existingOnly" | "never";
 
 type ResolvePreviewTargetParams = {
   lane: DraftLaneState;
@@ -132,6 +151,16 @@ type PreviewTargetResolution = {
   stopCreatesFirstPreview: boolean;
 };
 
+function result(
+  kind: LaneDeliveryResult["kind"],
+  delivery?: Extract<LaneDeliveryResult, { kind: "preview-finalized" }>["delivery"],
+): LaneDeliveryResult {
+  if (kind === "preview-finalized") {
+    return { kind, delivery: delivery! };
+  }
+  return { kind };
+}
+
 function shouldSkipRegressivePreviewUpdate(args: {
   currentPreviewText: string | undefined;
   text: string;
@@ -142,11 +171,42 @@ function shouldSkipRegressivePreviewUpdate(args: {
   if (currentPreviewText === undefined) {
     return false;
   }
+  if (args.skipRegressive === "never") {
+    return false;
+  }
   return (
     currentPreviewText.startsWith(args.text) &&
     args.text.length < currentPreviewText.length &&
     (args.skipRegressive === "always" || args.hadPreviewMessage)
   );
+}
+
+function isLongLivedPreview(visibleSinceMs: number | undefined, nowMs: number): boolean {
+  return (
+    typeof visibleSinceMs === "number" &&
+    Number.isFinite(visibleSinceMs) &&
+    nowMs - visibleSinceMs >= LONG_LIVED_PREVIEW_FRESH_FINAL_AFTER_MS
+  );
+}
+
+function compactPreviewFinalChunks(chunks: readonly string[]): string[] {
+  const result: string[] = [];
+  let pendingWhitespace = "";
+  for (const chunk of chunks) {
+    if (!chunk) {
+      continue;
+    }
+    if (chunk.trim().length === 0) {
+      pendingWhitespace += chunk;
+      continue;
+    }
+    result.push(`${pendingWhitespace}${chunk}`);
+    pendingWhitespace = "";
+  }
+  if (pendingWhitespace && result.length > 0) {
+    result[result.length - 1] = `${result[result.length - 1]}${pendingWhitespace}`;
+  }
+  return result;
 }
 
 function resolvePreviewTarget(params: ResolvePreviewTargetParams): PreviewTargetResolution {
@@ -167,47 +227,45 @@ function resolvePreviewTarget(params: ResolvePreviewTargetParams): PreviewTarget
 
 export function createLaneTextDeliverer(params: CreateLaneTextDelivererParams) {
   const getLanePreviewText = (lane: DraftLaneState) => lane.lastPartialText;
+  const readNow = () => params.now?.() ?? Date.now();
   const markActivePreviewComplete = (laneName: LaneName) => {
     params.activePreviewLifecycleByLane[laneName] = "complete";
     params.retainPreviewOnCleanupByLane[laneName] = true;
   };
-  const isDraftPreviewLane = (lane: DraftLaneState) => lane.stream?.previewMode?.() === "draft";
-  const canMaterializeDraftFinal = (
-    lane: DraftLaneState,
-    previewButtons?: TelegramInlineButtons,
-  ) => {
-    const hasPreviewButtons = Boolean(previewButtons && previewButtons.length > 0);
+  const isMessagePreviewLane = (lane: DraftLaneState) => lane.stream != null;
+  const wasVisiblyOverwrittenSince = (visibleSinceMs: number | undefined): boolean => {
+    if (typeof visibleSinceMs !== "number") {
+      return false;
+    }
+    const lastNonPreviewAt = params.getLastVisibleNonPreviewDeliveryAtMs?.();
+    return typeof lastNonPreviewAt === "number" && lastNonPreviewAt > visibleSinceMs;
+  };
+  const shouldUseFreshFinalForLane = (lane: DraftLaneState) => {
+    if (!isMessagePreviewLane(lane)) {
+      return false;
+    }
+    const visibleSinceMs = lane.stream?.visibleSinceMs?.();
     return (
-      isDraftPreviewLane(lane) &&
-      !hasPreviewButtons &&
-      typeof lane.stream?.materialize === "function"
+      isLongLivedPreview(visibleSinceMs, readNow()) || wasVisiblyOverwrittenSince(visibleSinceMs)
     );
   };
-
-  const tryMaterializeDraftPreviewForFinal = async (args: {
-    lane: DraftLaneState;
-    laneName: LaneName;
-    text: string;
-  }): Promise<boolean> => {
-    const stream = args.lane.stream;
-    if (!stream || !isDraftPreviewLane(args.lane)) {
-      return false;
+  const shouldUseFreshFinalForPreview = (lane: DraftLaneState, visibleSinceMs?: number) =>
+    isMessagePreviewLane(lane) &&
+    (isLongLivedPreview(visibleSinceMs, readNow()) || wasVisiblyOverwrittenSince(visibleSinceMs));
+  const buildFollowUpPayload = (payload: ReplyPayload, text: string) =>
+    params.applyTextToFollowUpPayload
+      ? params.applyTextToFollowUpPayload(payload, text)
+      : params.applyTextToPayload(payload, text);
+  const clearActivePreviewAfterFreshFinal = async (lane: DraftLaneState, laneName: LaneName) => {
+    try {
+      await lane.stream?.clear();
+    } catch (err) {
+      params.log(`telegram: ${laneName} fresh final preview cleanup failed: ${String(err)}`);
     }
-    // Draft previews have no message_id to edit; materialize the final text
-    // into a real message and treat that as the finalized delivery.
-    stream.update(args.text);
-    const materializedMessageId = await stream.materialize?.();
-    if (typeof materializedMessageId !== "number") {
-      params.log(
-        `telegram: ${args.laneName} draft preview materialize produced no message id; falling back to standard send`,
-      );
-      return false;
-    }
-    args.lane.lastPartialText = args.text;
-    params.markDelivered();
-    return true;
+    lane.lastPartialText = "";
+    lane.hasStreamedMessage = false;
+    lane.stream?.forceNewMessage();
   };
-
   const tryEditPreviewMessage = async (args: {
     laneName: LaneName;
     messageId: number;
@@ -218,6 +276,7 @@ export function createLaneTextDeliverer(params: CreateLaneTextDelivererParams) {
     lane: DraftLaneState;
     finalTextAlreadyLanded: boolean;
     retainAlternatePreviewOnMissingTarget: boolean;
+    targetPreviewText: string;
   }): Promise<PreviewEditResult> => {
     try {
       await params.editPreview({
@@ -280,7 +339,14 @@ export function createLaneTextDeliverer(params: CreateLaneTextDelivererParams) {
           );
           return "fallback";
         }
-        // Default: ambiguous error — prefer incomplete over duplicate
+        if (isIncompleteFinalPreviewPrefix(args.targetPreviewText, args.text)) {
+          params.log(
+            `telegram: ${args.laneName} preview final edit failed and existing preview is an incomplete prefix; falling back to standard send (${String(err)})`,
+          );
+          return "fallback";
+        }
+        // Default: ambiguous error — retain when fallback may duplicate a final
+        // edit that already landed or when the preview is not known-incomplete.
         params.log(
           `telegram: ${args.laneName} preview final edit failed with ambiguous error; keeping existing preview to avoid duplicate (${String(err)})`,
         );
@@ -292,6 +358,56 @@ export function createLaneTextDeliverer(params: CreateLaneTextDelivererParams) {
       );
       return "fallback";
     }
+  };
+  const tryDeliverLongFinalThroughPreview = async (args: {
+    lane: DraftLaneState;
+    laneName: LaneName;
+    text: string;
+    payload: ReplyPayload;
+    previewButtons?: TelegramInlineButtons;
+  }): Promise<LaneDeliveryResult | undefined> => {
+    if (
+      !args.lane.stream ||
+      args.previewButtons !== undefined ||
+      params.activePreviewLifecycleByLane[args.laneName] !== "transient"
+    ) {
+      return undefined;
+    }
+    const chunks = compactPreviewFinalChunks(params.splitFinalTextForPreview?.(args.text) ?? []);
+    const [firstChunk, ...remainingChunks] = chunks;
+    if (!firstChunk || remainingChunks.length === 0 || firstChunk.length > params.draftMaxChars) {
+      return undefined;
+    }
+    await params.flushDraftLane(args.lane);
+    const previewMessageId = args.lane.stream.messageId();
+    if (typeof previewMessageId !== "number") {
+      return undefined;
+    }
+    const finalized = await tryUpdatePreviewForLane({
+      lane: args.lane,
+      laneName: args.laneName,
+      text: firstChunk,
+      stopBeforeEdit: true,
+      updateLaneSnapshot: true,
+      skipRegressive: "never",
+      context: "final",
+    });
+    if (finalized === "fallback") {
+      return undefined;
+    }
+    if (finalized === "retained") {
+      markActivePreviewComplete(args.laneName);
+      return result("preview-retained");
+    }
+    markActivePreviewComplete(args.laneName);
+    const remainingText = remainingChunks.join("");
+    if (remainingText.trim().length > 0) {
+      await params.sendPayload(buildFollowUpPayload(args.payload, remainingText));
+    }
+    return result("preview-finalized", {
+      content: args.text,
+      messageId: previewMessageId,
+    });
   };
 
   const tryUpdatePreviewForLane = async ({
@@ -310,6 +426,7 @@ export function createLaneTextDeliverer(params: CreateLaneTextDelivererParams) {
       messageId: number,
       finalTextAlreadyLanded: boolean,
       retainAlternatePreviewOnMissingTarget: boolean,
+      targetPreviewText: string,
     ) =>
       tryEditPreviewMessage({
         laneName,
@@ -321,6 +438,7 @@ export function createLaneTextDeliverer(params: CreateLaneTextDelivererParams) {
         lane,
         finalTextAlreadyLanded,
         retainAlternatePreviewOnMissingTarget,
+        targetPreviewText,
       });
     const finalizePreview = (
       previewMessageId: number,
@@ -337,12 +455,13 @@ export function createLaneTextDeliverer(params: CreateLaneTextDelivererParams) {
       });
       if (shouldSkipRegressive) {
         params.markDelivered();
-        return "edited";
+        return "regressive-skipped";
       }
       return editPreview(
         previewMessageId,
         finalTextAlreadyLanded,
         retainAlternatePreviewOnMissingTarget,
+        currentPreviewText,
       );
     };
     if (!lane.stream) {
@@ -354,7 +473,7 @@ export function createLaneTextDeliverer(params: CreateLaneTextDelivererParams) {
       stopBeforeEdit,
       context,
     });
-    if (previewTargetBeforeStop.stopCreatesFirstPreview) {
+    if (previewTargetBeforeStop.stopCreatesFirstPreview && lane.hasStreamedMessage) {
       // Final stop() can create the first visible preview message.
       // Prime pending text so the stop flush sends the final text snapshot.
       lane.stream.update(text);
@@ -413,6 +532,19 @@ export function createLaneTextDeliverer(params: CreateLaneTextDelivererParams) {
     if (!archivedPreview) {
       return undefined;
     }
+    if (canEditViaPreview && shouldUseFreshFinalForPreview(lane, archivedPreview.visibleSinceMs)) {
+      const delivered = await params.sendPayload(params.applyTextToPayload(payload, text));
+      if (delivered) {
+        try {
+          await params.deletePreviewMessage(archivedPreview.messageId);
+        } catch (err) {
+          params.log(
+            `telegram: archived answer preview cleanup failed (${archivedPreview.messageId}): ${String(err)}`,
+          );
+        }
+        return result("sent");
+      }
+    }
     if (canEditViaPreview) {
       const finalized = await tryUpdatePreviewForLane({
         lane,
@@ -426,11 +558,20 @@ export function createLaneTextDeliverer(params: CreateLaneTextDelivererParams) {
         previewTextSnapshot: archivedPreview.textSnapshot,
       });
       if (finalized === "edited") {
-        return "preview-finalized";
+        return result("preview-finalized", {
+          content: text,
+          messageId: archivedPreview.messageId,
+        });
+      }
+      if (finalized === "regressive-skipped") {
+        return result("preview-finalized", {
+          content: archivedPreview.textSnapshot,
+          messageId: archivedPreview.messageId,
+        });
       }
       if (finalized === "retained") {
         params.retainPreviewOnCleanupByLane.answer = true;
-        return "preview-retained";
+        return result("preview-retained");
       }
     }
     // Send the replacement message first, then clean up the old preview.
@@ -447,7 +588,7 @@ export function createLaneTextDeliverer(params: CreateLaneTextDelivererParams) {
         );
       }
     }
-    return delivered ? "sent" : "skipped";
+    return delivered ? result("sent") : result("skipped");
   };
 
   return async ({
@@ -459,7 +600,8 @@ export function createLaneTextDeliverer(params: CreateLaneTextDelivererParams) {
     allowPreviewUpdateForNonFinal = false,
   }: DeliverLaneTextParams): Promise<LaneDeliveryResult> => {
     const lane = params.lanes[laneName];
-    const hasMedia = Boolean(payload.mediaUrl) || (payload.mediaUrls?.length ?? 0) > 0;
+    const reply = resolveSendableOutboundReplyParts(payload, { text });
+    const hasMedia = reply.hasMedia;
     const canEditViaPreview =
       !hasMedia && text.length > 0 && text.length <= params.draftMaxChars && !payload.isError;
 
@@ -496,17 +638,15 @@ export function createLaneTextDeliverer(params: CreateLaneTextDelivererParams) {
             return archivedResultAfterFlush;
           }
         }
-        if (canMaterializeDraftFinal(lane, previewButtons)) {
-          const materialized = await tryMaterializeDraftPreviewForFinal({
-            lane,
-            laneName,
-            text,
-          });
-          if (materialized) {
-            markActivePreviewComplete(laneName);
-            return "preview-finalized";
+        if (shouldUseFreshFinalForLane(lane)) {
+          await params.stopDraftLane(lane);
+          const delivered = await params.sendPayload(params.applyTextToPayload(payload, text));
+          if (delivered) {
+            await clearActivePreviewAfterFreshFinal(lane, laneName);
+            return result("sent");
           }
         }
+        const previewMessageId = lane.stream?.messageId();
         const finalized = await tryUpdatePreviewForLane({
           lane,
           laneName,
@@ -518,41 +658,43 @@ export function createLaneTextDeliverer(params: CreateLaneTextDelivererParams) {
         });
         if (finalized === "edited") {
           markActivePreviewComplete(laneName);
-          return "preview-finalized";
+          return result("preview-finalized", {
+            content: text,
+            messageId: previewMessageId ?? lane.stream?.messageId(),
+          });
+        }
+        if (finalized === "regressive-skipped") {
+          markActivePreviewComplete(laneName);
+          return result("preview-finalized", {
+            content: lane.lastPartialText,
+            messageId: previewMessageId ?? lane.stream?.messageId(),
+          });
         }
         if (finalized === "retained") {
           markActivePreviewComplete(laneName);
-          return "preview-retained";
+          return result("preview-retained");
         }
       } else if (!hasMedia && !payload.isError && text.length > params.draftMaxChars) {
+        const longFinalResult = await tryDeliverLongFinalThroughPreview({
+          lane,
+          laneName,
+          text,
+          payload,
+          previewButtons,
+        });
+        if (longFinalResult) {
+          return longFinalResult;
+        }
         params.log(
           `telegram: preview final too long for edit (${text.length} > ${params.draftMaxChars}); falling back to standard send`,
         );
       }
       await params.stopDraftLane(lane);
       const delivered = await params.sendPayload(params.applyTextToPayload(payload, text));
-      return delivered ? "sent" : "skipped";
+      return delivered ? result("sent") : result("skipped");
     }
 
     if (allowPreviewUpdateForNonFinal && canEditViaPreview) {
-      if (isDraftPreviewLane(lane)) {
-        // DM draft flow has no message_id to edit; updates are sent via sendMessageDraft.
-        // Only mark as updated when the draft flush actually emits an update.
-        const previewRevisionBeforeFlush = lane.stream?.previewRevision?.() ?? 0;
-        lane.stream?.update(text);
-        await params.flushDraftLane(lane);
-        const previewUpdated = (lane.stream?.previewRevision?.() ?? 0) > previewRevisionBeforeFlush;
-        if (!previewUpdated) {
-          params.log(
-            `telegram: ${laneName} draft preview update not emitted; falling back to standard send`,
-          );
-          const delivered = await params.sendPayload(params.applyTextToPayload(payload, text));
-          return delivered ? "sent" : "skipped";
-        }
-        lane.lastPartialText = text;
-        params.markDelivered();
-        return "preview-updated";
-      }
       const updated = await tryUpdatePreviewForLane({
         lane,
         laneName,
@@ -563,12 +705,12 @@ export function createLaneTextDeliverer(params: CreateLaneTextDelivererParams) {
         skipRegressive: "always",
         context: "update",
       });
-      if (updated === "edited") {
-        return "preview-updated";
+      if (updated === "edited" || updated === "regressive-skipped") {
+        return result("preview-updated");
       }
     }
 
     const delivered = await params.sendPayload(params.applyTextToPayload(payload, text));
-    return delivered ? "sent" : "skipped";
+    return delivered ? result("sent") : result("skipped");
   };
 }

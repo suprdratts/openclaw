@@ -2,15 +2,11 @@ import {
   detectZaiEndpoint as detectZaiEndpointCore,
   type ZaiDetectedEndpoint,
   type ZaiEndpointId,
-} from "../../src/commands/zai-endpoint-detect.js";
+} from "./runtime-api.js";
 
 type DetectZaiEndpointFn = typeof detectZaiEndpointCore;
 
 let detectZaiEndpointImpl: DetectZaiEndpointFn = detectZaiEndpointCore;
-
-export function setDetectZaiEndpointForTesting(fn?: DetectZaiEndpointFn): void {
-  detectZaiEndpointImpl = fn ?? detectZaiEndpointCore;
-}
 
 export async function detectZaiEndpoint(
   ...args: Parameters<DetectZaiEndpointFn>

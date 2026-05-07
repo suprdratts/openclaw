@@ -4,7 +4,7 @@
  * bounced back as a new inbound message — creating an echo loop.
  */
 
-import { findCodeRegions, isInsideCode } from "../../../../src/shared/text/code-regions.js";
+import { findCodeRegions, isInsideCode } from "openclaw/plugin-sdk/text-runtime";
 
 const INTERNAL_SEPARATOR_RE = /(?:#\+){2,}#?/;
 const ASSISTANT_ROLE_MARKER_RE = /\bassistant\s+to\s*=\s*\w+/i;
@@ -22,7 +22,7 @@ const REFLECTION_PATTERNS: Array<{ re: RegExp; label: string }> = [
   { re: FINAL_TAG_RE, label: "final-tag" },
 ];
 
-export type ReflectionDetection = {
+type ReflectionDetection = {
   isReflection: boolean;
   matchedLabels: string[];
 };
